@@ -25,6 +25,7 @@ flux_dataset/
 img_venv/
 processed_for_SXDL/
 processed_output/
+core/
 
 # Other Python files (keeping only main app)
 caption.py

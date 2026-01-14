@@ -15,6 +15,79 @@ import shutil
 import io
 from io import BytesIO
 import threading
+import boto3
+from botocore.exceptions import ClientError
+import requests
+
+bucket_name = os.getenv("bucket_name")
+region = os.getenv("region")
+secret_key=os.getenv("secret_key")
+access_key_id = os.getenv("access_key_id")
+
+s3_client = boto3.client(
+    's3',
+    region_name=region,
+    aws_access_key_id = access_key_id,
+    aws_secret_access_key=secret_key
+)
+
+def s3_upload_file(file_name, file_object):
+    """
+    Upload an image to S3 by saving locally first, then delete local file
+    
+    Args:
+        file_name: Desired filename (used for both local save and S3 object name)
+        file_object: google.genai.types.Image or PIL Image object
+    
+    Returns:
+        str: Public URL of uploaded image
+    """
+    object_name = file_name.split('/')[-1]
+    object_name = object_name.replace(' ', '-')
+    
+    try:
+        # Save locally first (Google's Image object supports .save())
+        file_object.save(file_name)
+        
+        # Upload the saved file
+        s3_client.upload_file(
+            file_name,  # Now it's a file path string
+            bucket_name,
+            object_name,
+            ExtraArgs={'ContentType': 'image/png'}
+        )
+        
+        url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{object_name}"
+        
+        # Delete local file after successful upload
+        if os.path.exists(file_name):
+            os.remove(file_name)
+            logger.info(f"🗑️ Deleted local file: {file_name}")
+        
+        return url
+        
+    except Exception as e:
+        # Clean up local file even if upload fails
+        if os.path.exists(file_name):
+            os.remove(file_name)
+            logger.info(f"🗑️ Deleted local file after error: {file_name}")
+        raise e
+
+def download_image(self, object_name, save_path):
+        """
+        Download an image from S3
+        
+        :param object_name: S3 object key
+        :param save_path: Local path to save file
+        :return: True if successful, False otherwise
+        """
+        try:
+            self.s3_client.download_file(self.bucket_name, object_name, save_path)
+            print(f"✅ Downloaded: {save_path}")
+            return True
+        except ClientError as e:
+            print(f"❌ Error downloading: {e}")
+            return False
 
 load_dotenv()
 
@@ -298,9 +371,9 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
         for part in response.parts:
             if part.inline_data is not None:
                 image = part.as_image()
-                image.save(output_path)
+                image_url = s3_upload_file(output_path,image)
                 logger.info(f"✓ Saved image: {output_path}")
-                return output_path
+                return image_url
         
         logger.error("No image data in response")
         return None
@@ -375,13 +448,7 @@ def generate_image_without_prompt_generation(refined_prompt, aspect_ratio,provid
                 # Extract and save image
                 image = part.as_image()
                 output_path = f"generated_jump_rope_{uuid.uuid4().hex[:8]}.png"
-                image.save(output_path)
-                
-                # Verify saved file
-                saved_size = os.path.getsize(output_path) / (1024 * 1024)
-                logger.info(f"💾 Image saved successfully:")
-                logger.info(f"   Path: {output_path}")
-                
+                image_url = s3_upload_file(output_path,image)
                 # CLEANUP: Close all loaded reference images
                 if loaded_images:
                     logger.info(f"🧹 Closing {len(loaded_images)} reference images...")
@@ -392,7 +459,7 @@ def generate_image_without_prompt_generation(refined_prompt, aspect_ratio,provid
                             logger.warning(f"   ⚠️ Error closing image: {cleanup_error}")
                     logger.info("   ✅ All reference images closed")
                 
-                return {"image_path": output_path, "client":  client,"chat_session": chat_session,"aspect_ratio" : aspect_ratio}
+                return {"image_path": image_url, "client":  client,"chat_session": chat_session,"aspect_ratio" : aspect_ratio}
                 
             except Exception as e:
                 logger.error(f"❌ Failed to save image: {str(e)}")
@@ -446,7 +513,7 @@ def generate_multiple_images_with_single_prompt(
             )
         )
     )
-    logger.info("\n\nMessage sent to gemini : ", message_content)
+    logger.info(f"\n\nMessage sent to gemini : {message_content}")
     response = chat_session.send_message(message_content)
 
     logger.info("✅ Chat session created successfully")
@@ -475,16 +542,12 @@ def generate_multiple_images_with_single_prompt(
                     first_image_pil = Image.open(io.BytesIO(part.inline_data.data))
                   # Store for later use
                 output_path = f"generated_jump_rope_{uuid.uuid4().hex[:8]}.png"
-                image.save(output_path)
+                image_url = s3_upload_file(output_path,image)
                 
-                # Verify saved file
-                saved_size = os.path.getsize(output_path) / (1024 * 1024)
-                logger.info(f"💾 Image saved successfully:")
-                logger.info(f"   Path: {output_path}")
                 
                 # Add first image to registry (index 0)
                 image_registry[0] = {
-                    "image_path": output_path,
+                    "image_path": image_url,
                     "client": client,
                     "chat_session": chat_session,
                     "aspect_ratio": aspect_ratios[0]
@@ -661,12 +724,7 @@ def generate_image_with_chat(user_prompt, image_paths, aspect_ratio,client=None,
                     # Extract and save image
                     image = part.as_image()
                     output_path = f"generated_jump_rope_{uuid.uuid4().hex[:8]}.png"
-                    image.save(output_path)
-                    
-                    # Verify saved file
-                    saved_size = os.path.getsize(output_path) / (1024 * 1024)
-                    logger.info(f"💾 Image saved successfully:")
-                    logger.info(f"   Path: {output_path}")
+                    image_url = s3_upload_file(output_path,image)
                     
                     # CLEANUP: Close all loaded reference images
                     if loaded_images:
@@ -678,7 +736,7 @@ def generate_image_with_chat(user_prompt, image_paths, aspect_ratio,client=None,
                                 logger.warning(f"   ⚠️ Error closing image: {cleanup_error}")
                         logger.info("   ✅ All reference images closed")
                     
-                    return output_path, client, chat_session
+                    return image_url, client, chat_session
                     
                 except Exception as e:
                     logger.error(f"❌ Failed to save image: {str(e)}")
@@ -1059,15 +1117,22 @@ with col1:
                             st.text(f"{edit_idx}. {edit}")
                 
                 # Download button for this specific image (MOVED INSIDE THE LOOP)
-                with open(img_data['image_path'], "rb") as file:
-                    st.download_button(
-                        label="📥 Download",
-                        data=file,
-                        file_name=f"image_{img_id + 1}_{os.path.basename(img_data['image_path'])}",
-                        mime="image/png",
-                        use_container_width=True,
-                        key=f"download_{img_id}"
-                    )
+                try:
+    # Fetch image from S3 URL
+                    response = requests.get(img_data['image_path'])
+                    if response.status_code == 200:
+                        st.download_button(
+                            label="📥 Download",
+                            data=response.content,
+                            file_name=f"image_{img_id + 1}_{os.path.basename(img_data['image_path'])}",
+                            mime="image/png",
+                            use_container_width=True,
+                            key=f"download_{img_id}"
+                        )
+                    else:
+                        st.error(f"Failed to fetch image {img_id + 1}")
+                except Exception as e:
+                    st.error(f"Error downloading image: {e}")
 with col2:
     if st.button("🎨 Generate 3 Variations", type="primary", use_container_width=True):
         if prompt and image_paths:
@@ -1112,16 +1177,24 @@ with col2:
     # Display stored images
     if len(st.session_state.generated_images) == 3:
         img_cols = st.columns(3)
-        
+    
         for idx, path in enumerate(st.session_state.generated_images):
             with img_cols[idx]:
                 st.image(path, caption=f"Variation {idx+1}")
-                with open(path, "rb") as file:
-                    st.download_button(
-                        label=f"📥 #{idx+1}",
-                        data=file,
-                        file_name=path,
-                        mime="image/png",
-                        key=f"dl_btn_{idx}",
-                        use_container_width=True
-                    )
+                
+                try:
+                    # Fetch image from S3 URL
+                    response = requests.get(path)
+                    if response.status_code == 200:
+                        st.download_button(
+                            label=f"📥 #{idx+1}",
+                            data=response.content,
+                            file_name=f"variation_{idx+1}.png",
+                            mime="image/png",
+                            key=f"dl_btn_{idx}",
+                            use_container_width=True
+                        )
+                    else:
+                        st.error(f"Failed to fetch variation {idx+1}")
+                except Exception as e:
+                    st.error(f"Error downloading: {e}")

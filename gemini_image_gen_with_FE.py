@@ -18,6 +18,8 @@ import threading
 import boto3
 from botocore.exceptions import ClientError
 import requests
+import gc
+import psutil
 
 bucket_name = os.getenv("bucket_name")
 region = os.getenv("region")
@@ -94,53 +96,47 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def log_memory_usage(location=""):
+    """Log current memory usage"""
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    mem_mb = mem_info.rss / 1024 / 1024  # Convert to MB
+    
+    # System-wide memory
+    sys_mem = psutil.virtual_memory()
+    sys_used_gb = sys_mem.used / 1024 / 1024 / 1024
+    sys_total_gb = sys_mem.total / 1024 / 1024 / 1024
+    sys_percent = sys_mem.percent
+    
+    logger.info(f"📊 MEMORY {location}")
+    logger.info(f"   Process: {mem_mb:.1f} MB")
+    logger.info(f"   System: {sys_used_gb:.1f}/{sys_total_gb:.1f} GB ({sys_percent}%)")
+    
+    return mem_mb, sys_percent
+
+
 GEMINI_API_KEY = os.getenv("GEMINI_KEY")
 image_lock = threading.Lock()
-image_content = []
+
 def load_images(images_path):
-
+    image_content = []
+    
+    gc.collect()
+    
+    # Load fresh images
+    logger.info(f"📸 Loading {len(images_path)} new images")
     for image_path in images_path:
-        img = Image.open(image_path)
-        img.load()
-        image_content.append(img)
-        logger.info(f"✓ Loaded: {os.path.basename(image_path)}")
+        try:
+            img = Image.open(image_path)
+            img.load()
+            image_content.append(img)
+            logger.info(f"✓ Loaded: {os.path.basename(image_path)}")
+        except Exception as e:
+            logger.error(f"Failed to load {image_path}: {e}")
+    log_memory_usage("after load_images()")
+    return image_content
 
-# image_content_parts = []
-# def load_images(images_path):
-#     global count
-#     if count == 0:
-#         for image_path in images_path:
-#             with Image.open(image_path) as img:
-#                 # 1. Force Load
-#                 img.load()
-                
-#                 # 2. Resize if too large (CRITICAL for multi-thread reliability)
-#                 # Gemini doesn't need 4K. 1024px is plenty and 4x faster to upload.
-#                 max_size = 1024
-#                 if max(img.size) > max_size:
-#                     ratio = max_size / max(img.size)
-#                     new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-#                     img = img.resize(new_size, Image.Resampling.LANCZOS)
-                
-#                 # 3. Convert to immutable BYTES immediately
-#                 buf = BytesIO()
-#                 # Default to PNG, or preserve original format if available
-#                 fmt = img.format if img.format else 'PNG'
-#                 img.save(buf, format=fmt)
-#                 byte_data = buf.getvalue()
-                
-#                 # 4. Store as a Gemini-ready Part dictionary
-#                 image_content_parts.append({
-#                     'mime_type': f'image/{fmt.lower()}',
-#                     'data': byte_data
-#                 })
-                
-#             logger.info(f"✓ Loaded & Optimized: {os.path.basename(image_path)}")
-
-#         if len(image_content_parts) > 0:
-#             count = 1
-
-def refine_prompt(user_prompt, variation_number=None, selected_color=None):
+def refine_prompt(user_prompt,image_paths, variation_number=None, selected_color=None):
     """
     Refine user prompts for Gemini 3 Pro Image generation with MAXIMUM CONSISTENCY.
     Based on official Google documentation best practices.
@@ -227,14 +223,11 @@ Here are some example prompts with good results, You can take refrence from them
         import os
         import glob
         try:
-            local_images = []
-            with image_lock:
-                # Create a fresh copy of the actual IMAGE OBJECT, not just the list
-                for img in image_content:
-                    local_images.append(img.copy())
+            local_images = load_images(image_paths)
             contents = [system_instruction] + local_images
             logger.info("Content loaded with images")
-        except :
+        except Exception as e :
+            logger.error("error loading images : ",e)
             contents = [system_instruction]
             logger.info("Content loaded without images")
 
@@ -280,7 +273,7 @@ Here are some example prompts with good results, You can take refrence from them
         
         logger.info(f"✓ Refined prompt generated (variation: {variation_number})")
         logger.debug(f"Prompt preview: {refined[:200]}...")
-        
+        log_memory_usage("after refined prompt()")
         return refined
     
     except Exception as e:
@@ -288,7 +281,14 @@ Here are some example prompts with good results, You can take refrence from them
         # Fallback: return enhanced user prompt
         color_fallback = f" Use color {selected_color}." if selected_color else ""
         return f"Based on the uploaded reference images, {user_prompt}.{color_fallback} Maintain all physical characteristics exactly as shown. Professional studio photography, clean product."
-
+    finally:
+        # CRITICAL: Close all copied images
+        logger.info(f"🧹 Closing {len(local_images)} copied images in refine_prompt")
+        for img in local_images:
+            try:
+                img.close()
+            except Exception as cleanup_error:
+                logger.warning(f"Error closing image: {cleanup_error}")
 
 def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42, resolution="1K", aspect_ratio="16:9", selected_color=None):
     """
@@ -316,7 +316,7 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
         image_paths = image_paths[:10]
     
     # CRITICAL: Generate refined prompt with controlled variation and color
-    refined_prompt = refine_prompt(user_prompt, variation_number=variation_number, selected_color=selected_color)
+    refined_prompt = refine_prompt(user_prompt,image_paths,variation_number=variation_number, selected_color=selected_color)
     
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
@@ -324,12 +324,8 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
         # IMPORTANT: Reference images MUST be included in generation contents
         
     # Create a fresh copy of the actual IMAGE OBJECT, not just the list
-        api_image_parts = []
-        with image_lock:
-            for img_dict in image_content:
-                image = img_dict.copy()
-                api_image_parts.append(image)
-
+        api_image_parts = load_images(image_paths)
+        
         contents = [refined_prompt] + api_image_parts
         
         # Calculate deterministic seed for this variation
@@ -351,20 +347,11 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
                 image_config=types.ImageConfig(
                 aspect_ratio=aspect_ratio,
                 image_size=resolution
-                ) # Keep at 1.0 (Google's recommendation for Gemini 3)
+                )
             )
         )
         
-        # model="gemini-3-pro-image-preview",
-        # config=types.GenerateContentConfig(
-        #     response_modalities=['TEXT', 'IMAGE'],
-        #     temperature=0.5,
-        #     image_config=types.ImageConfig(
-        #         aspect_ratio=aspect_ratio,
-        #         image_size=resolution
-        #     )
-        # )
-        # Use UUID for unique filenames
+       
         variation_suffix = f"_v{variation_number}" if variation_number is not None else ""
         output_path = f"generated_jump_rope_{uuid.uuid4().hex[:8]}{variation_suffix}.png"
         
@@ -373,6 +360,7 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
                 image = part.as_image()
                 image_url = s3_upload_file(output_path,image)
                 logger.info(f"✓ Saved image: {output_path}")
+                log_memory_usage("after generate_image()")
                 return image_url
         
         logger.error("No image data in response")
@@ -381,7 +369,14 @@ def generate_image(user_prompt, image_paths, variation_number=None, base_seed=42
     except Exception as e:
         logger.error(f"Error generating image: {e}")
         return None
-    
+    finally:
+        # CRITICAL: Close all copied images
+        logger.info(f"🧹 Closing {len(api_image_parts)} copied images in refine_prompt")
+        for img in api_image_parts:
+            try:
+                img.close()
+            except Exception as cleanup_error:
+                logger.warning(f"Error closing image: {cleanup_error}")
 
 def generate_image_without_prompt_generation(refined_prompt, aspect_ratio,provided_image,client=None, chat_session=None, resolution="1K"):
     
@@ -450,15 +445,15 @@ def generate_image_without_prompt_generation(refined_prompt, aspect_ratio,provid
                 output_path = f"generated_jump_rope_{uuid.uuid4().hex[:8]}.png"
                 image_url = s3_upload_file(output_path,image)
                 # CLEANUP: Close all loaded reference images
-                if loaded_images:
-                    logger.info(f"🧹 Closing {len(loaded_images)} reference images...")
-                    for img in loaded_images:
+                if provided_image:
+                    logger.info(f"🧹 Closing {len(provided_image)} reference images...")
+                    for img in provided_image:
                         try:
                             img.close()
                         except Exception as cleanup_error:
                             logger.warning(f"   ⚠️ Error closing image: {cleanup_error}")
                     logger.info("   ✅ All reference images closed")
-                
+                log_memory_usage("after generate_without_prompt()")
                 return {"image_path": image_url, "client":  client,"chat_session": chat_session,"aspect_ratio" : aspect_ratio}
                 
             except Exception as e:
@@ -486,17 +481,14 @@ def generate_image_without_prompt_generation(refined_prompt, aspect_ratio,provid
 def generate_multiple_images_with_single_prompt(
     user_prompt,
     aspect_ratios,
+    image_paths,
     resolution="1K",
     selected_color=None
 ):
     variation_1 = None
-    refined_prompt = refine_prompt(user_prompt, variation_1, selected_color)
+    refined_prompt = refine_prompt(user_prompt, image_paths,variation_1, selected_color)
 
-    api_image_parts = []
-    with image_lock:
-        for img_dict in image_content:
-            image_copy = img_dict.copy()
-            api_image_parts.append(image_copy)
+    api_image_parts = load_images(images_path=image_paths)
 
     message_content = [refined_prompt] + api_image_parts
     logger.info("🔧 Creating new persistent client")
@@ -544,6 +536,14 @@ def generate_multiple_images_with_single_prompt(
                 output_path = f"generated_jump_rope_{uuid.uuid4().hex[:8]}.png"
                 image_url = s3_upload_file(output_path,image)
                 
+        # CRITICAL: Close all copied images
+                logger.info(f"🧹 Closing {len(api_image_parts)} copied images in refine_prompt")
+                for img in api_image_parts:
+                    try:
+                        img.close()
+                    except Exception as cleanup_error:
+                        logger.warning(f"Error closing image: {cleanup_error}")
+                
                 
                 # Add first image to registry (index 0)
                 image_registry[0] = {
@@ -554,9 +554,9 @@ def generate_multiple_images_with_single_prompt(
                 }
                 
                 # CLEANUP: Close all loaded reference images
-                if loaded_images:
-                    logger.info(f"🧹 Closing {len(loaded_images)} reference images...")
-                    for img in loaded_images:
+                if api_image_parts:
+                    logger.info(f"🧹 Closing {len(api_image_parts)} reference images...")
+                    for img in api_image_parts:
                         try:
                             img.close()
                         except Exception as cleanup_error:
@@ -595,7 +595,7 @@ def generate_multiple_images_with_single_prompt(
 
                     if result is None:
                         continue
-
+                    first_image_pil.close()
                     image_registry[image_id] = {
                         "image_path": result["image_path"],
                         "client": result["client"],
@@ -603,10 +603,10 @@ def generate_multiple_images_with_single_prompt(
                     }
                 except Exception as e:
                     logger.error(f"❌ Failed to generate variation {image_id}: {str(e)}")
-
+    log_memory_usage("after single image()")
     return image_registry
 
-def generate_image_with_chat(user_prompt, image_paths, aspect_ratio,client=None, chat_session=None, resolution="1K", selected_color=None):
+def generate_image_with_chat(user_prompt, image_paths, aspect_ratio, resolution="1K", selected_color=None):
     """
     Generate/edit image using Gemini 3 Pro Image with multi-turn chat support.
     EXPLICITLY loads and sends all reference images to the model using BytesIO.
@@ -623,7 +623,8 @@ def generate_image_with_chat(user_prompt, image_paths, aspect_ratio,client=None,
     Returns:
         tuple: (output_path, client, chat_session) - path to saved image, client, and chat session for next turn
     """
-    
+    chat_session=None
+    client = None
     if not user_prompt or not user_prompt.strip():
         logger.error("❌ Empty user prompt provided")
         return None, client, None
@@ -648,10 +649,9 @@ def generate_image_with_chat(user_prompt, image_paths, aspect_ratio,client=None,
             logger.info(f"   Aspect Ratio: {aspect_ratios}")
             logger.info(f"   Temperature: 1.0")
             variation_1=None
-            refined_prompt = refine_prompt(user_prompt,variation_1,selected_color)
+            refined_prompt = refine_prompt(user_prompt,image_paths,variation_1,selected_color)
             # CRITICAL: Build message content with prompt FIRST, then ALL images
-            with image_lock:
-                thread_images = image_content.copy()
+            thread_images = load_images(image_paths)
             message_content = [refined_prompt] + thread_images
 
             chat_session = client.chats.create(
@@ -727,16 +727,16 @@ def generate_image_with_chat(user_prompt, image_paths, aspect_ratio,client=None,
                     image_url = s3_upload_file(output_path,image)
                     
                     # CLEANUP: Close all loaded reference images
-                    if loaded_images:
-                        logger.info(f"🧹 Closing {len(loaded_images)} reference images...")
-                        for img in loaded_images:
+                    if thread_images:
+                        logger.info(f"🧹 Closing {len(thread_images)} reference images...")
+                        for img in thread_images:
                             try:
                                 img.close()
                             except Exception as cleanup_error:
                                 logger.warning(f"   ⚠️ Error closing image: {cleanup_error}")
                         logger.info("   ✅ All reference images closed")
                     
-                    return image_url, client, chat_session
+                    return image_url
                     
                 except Exception as e:
                     logger.error(f"❌ Failed to save image: {str(e)}")
@@ -759,7 +759,7 @@ def generate_image_with_chat(user_prompt, image_paths, aspect_ratio,client=None,
         logger.info("🔍 Parsing response parts:")
         
         # CLEANUP: Close images even if generation failed
-        return None , client, chat_session
+        return None
     
     except Exception as e:
         logger.error("="*80)
@@ -773,7 +773,7 @@ def generate_image_with_chat(user_prompt, image_paths, aspect_ratio,client=None,
         logger.info("="*80)
         
         # CLEANUP: Close images even on exception
-        return None, client, None
+        return None
     
 
 
@@ -965,7 +965,7 @@ st.info(f"Loading images from: {folder_path}")
 # Load images from the selected folder
 # These functions will be called whenever the dropdown selection changes
 image_paths = get_images_from_folder(folder_path)
-loaded_images = load_images(image_paths)
+log_memory_usage("after image_paths")
 
 st.divider()
 if len(aspect_ratios) < 1:
@@ -1001,12 +1001,11 @@ with col1:
                 # Returns dictionary with image_id as key
                 image_registry = generate_multiple_images_with_single_prompt(
                     prompt,
-                    aspect_ratios=aspect_ratios,
+                    aspect_ratios,
+                    image_paths,
                     resolution=resolution,
                     selected_color=st.session_state.selected_color
                 )
-
-                load_images(image_paths)
                 
                 if image_registry:
                     # Store the registry in session state
@@ -1072,23 +1071,17 @@ with col1:
                                     logger.info(f"🎨 Selected color: {st.session_state.selected_color}")
                                     logger.info(f"🔄 Edit number: {len(st.session_state.edit_history[img_id]) + 1}")
                                     
-                                    result_path, updated_client, updated_chat = generate_image_with_chat(
+                                    result_path = generate_image_with_chat(
                                         edit_prompt,
-                                        image_paths=None,
-                                        client=img_data['client'],
-                                        chat_session=img_data['chat_session'],
+                                        image_paths=image_paths,
                                         resolution=resolution,
                                         aspect_ratio=aspect_ratios[img_id],
                                         selected_color=st.session_state.selected_color
                                     )
-
-                                    load_images(image_paths)
                                     
                                     if result_path:
                                         # Update the specific image in registry
                                         st.session_state.image_registry[img_id]['image_path'] = result_path
-                                        st.session_state.image_registry[img_id]['client'] = updated_client
-                                        st.session_state.image_registry[img_id]['chat_session'] = updated_chat
                                         st.session_state.edit_history[img_id].append(edit_prompt)
                                         if 'show_edit_field' not in st.session_state:
                                             st.session_state.show_edit_field = {}
@@ -1152,7 +1145,6 @@ with col2:
                     resolution=resolution,
                     selected_color=st.session_state.selected_color
                 )
-                load_images(image_paths)
                 if result_paths:
                     st.session_state.generated_images = result_paths
                     # Reset single image session when generating variations
